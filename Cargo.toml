@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/needle-format",
+    "crates/needle-tokenizer",
+    "crates/needle-model",
+    "crates/needle-engine",
+    "crates/needle-agent",
+    "crates/needle-build",
+    "crates/needle-cli",
+    "examples/smart_home",
+]
+
+[workspace.package]
+version = "3.0.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/awdemos/needle"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+half = "2"
+ureq = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

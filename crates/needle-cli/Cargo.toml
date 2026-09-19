@@ -1,0 +1,21 @@
+[package]
+name = "needle-cli"
+description = "needle-rs CLI: run, embed, info, tokens, download"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "needle-rs"
+path = "src/main.rs"
+
+[dependencies]
+needle-format = { path = "../needle-format" }
+needle-tokenizer = { path = "../needle-tokenizer" }
+needle-model = { path = "../needle-model" }
+needle-engine = { path = "../needle-engine" }
+needle-agent = { path = "../needle-agent" }
+serde_json = "1"
+clap = { workspace = true }
+ureq = { workspace = true }
+needle-build = { path = "../needle-build" }

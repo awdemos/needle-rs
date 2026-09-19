@@ -1,0 +1,16 @@
+[package]
+name = "needle-agent"
+description = "Needle 3 agent API: tools, run loop, extraction, grounding validation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+needle-format = { path = "../needle-format" }
+needle-tokenizer = { path = "../needle-tokenizer" }
+needle-model = { path = "../needle-model" }
+needle-engine = { path = "../needle-engine" }
+serde = { workspace = true }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+fancy-regex = "0.14"

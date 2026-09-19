@@ -1,0 +1,17 @@
+[package]
+name = "needle-engine"
+description = "Needle 3 engine: prompt rendering, grammar-constrained tool-call decoding, response envelope, confidence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+needle-format = { path = "../needle-format" }
+needle-tokenizer = { path = "../needle-tokenizer" }
+needle-model = { path = "../needle-model" }
+serde = { workspace = true }
+serde_json = "1"
+rayon.workspace = true
+
+[dev-dependencies]
+needle-format = { path = "../needle-format" }
