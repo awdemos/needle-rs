@@ -7,6 +7,12 @@ extraction. This workspace is a from-scratch, pure-Rust runtime: it loads the sa
 schemas into a byte-level decode grammar, and returns the same response envelope
 as the Python package — no native engine, no JAX, no SentencePiece.
 
+> **Disclaimer:** needle-rs is a community project. It is not affiliated with,
+> endorsed by, or supported by Cactus Compute (the developers of Needle), and
+> it is not an official Rust implementation of Needle. Trademarks and model
+> weights belong to their respective owners; the weights are downloaded from
+> the upstream project's published channels.
+
 ```
 crates/
   needle-format    .cact archive reader (header, CQ 1/2/3/4-bit + ternary, tokenizer blob)
