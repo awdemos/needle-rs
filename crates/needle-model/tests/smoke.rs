@@ -1,6 +1,6 @@
 use needle_model::Model;
 use needle_format::read_archive;
-use needle_tokenizer::{Tokenizer, BOS_ID, EOS_ID, IM_START, IM_END, TOOLS_START, TOOLS_END, TOOL_CALL_START, TOOL_CALL_END, THINK_START};
+use needle_tokenizer::{Tokenizer, BOS_ID, EOS_ID, IM_START, IM_END, TOOLS_START, TOOLS_END, TOOL_CALL_START, TOOL_CALL_END};
 
 fn models_dir() -> std::path::PathBuf {
     std::env::var("NEEDLE_MODELS_DIR")

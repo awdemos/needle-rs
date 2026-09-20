@@ -15,7 +15,7 @@ members = [
 version = "3.0.1"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/awdemos/needle"
+repository = "https://github.com/awdemos/needle-rs"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

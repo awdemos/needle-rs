@@ -9,7 +9,9 @@ use needle_tokenizer::{IM_END, IM_START, TOOLS_END, TOOLS_START};
 
 /// Render the prompt for one turn. `tools_json` is the compact JSON schema list.
 pub fn render(tools_json: &str, query: &str, system: Option<&str>) -> String {
-    let prefix = match system {
+    // finetune.py::render_example strips the system string and omits the
+    // system turn entirely when nothing remains after trimming
+    let prefix = match system.map(str::trim) {
         Some(s) if !s.is_empty() => format!("{IM_START}system\n{s}{IM_END}\n"),
         _ => String::new(),
     };
@@ -56,5 +58,19 @@ mod tests {
     fn system_prefix() {
         let p = render("[]", "q", Some("date: 2026-07-21 Tue 14:30"));
         assert!(p.starts_with(&format!("{IM_START}system\ndate: 2026-07-21 Tue 14:30<|im_end|>\n")));
+    }
+
+    #[test]
+    fn whitespace_only_system_is_omitted() {
+        // mirrors finetune.py: a stripped-empty system renders no system turn
+        let p = render("[]", "q", Some("   \n\t  "));
+        assert!(p.starts_with(&format!("{IM_START}user\n")));
+        assert!(!p.contains(&format!("{IM_START}system")));
+    }
+
+    #[test]
+    fn system_prompt_is_trimmed() {
+        let p = render("[]", "q", Some("  date: today  "));
+        assert!(p.starts_with(&format!("{IM_START}system\ndate: today{IM_END}\n")));
     }
 }

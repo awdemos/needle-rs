@@ -76,9 +76,9 @@ fn matches_jax_tiny_model() {
 
     let mut worst_a = 0.0f32;
     let mut worst_q = 0.0f32;
-    for t in 0..tokens.len() {
-        worst_a = worst_a.max(worst_diff(&oracle["logits_a"], &got_logits[t], t, vocab));
-        worst_q = worst_q.max(worst_diff(&oracle["logits_q"], &got_logits[t], t, vocab));
+    for (t, got) in got_logits.iter().enumerate() {
+        worst_a = worst_a.max(worst_diff(&oracle["logits_a"], got, t, vocab));
+        worst_q = worst_q.max(worst_diff(&oracle["logits_q"], got, t, vocab));
     }
     println!("logits: worst |diff| vs archive-ref = {worst_a:.6}, vs tree-ref = {worst_q:.6}, argmax misses vs archive-ref = {argmiss_a}/{}", tokens.len());
     assert!(worst_a < 2e-3, "logits diverge from the archive-exact reference: {worst_a}");
@@ -87,11 +87,11 @@ fn matches_jax_tiny_model() {
     let cells = model.cells_for(&tokens).unwrap();
     let cells_a = oracle["cells_a"].as_array().unwrap();
     let mut worst_ca = 0.0f32;
-    for t in 0..tokens.len() {
+    for (t, row_t) in cells_a.iter().enumerate().take(tokens.len()) {
         for r in 0..cells.rows {
-            let want_row = cells_a[t].as_array().unwrap()[r].as_array().unwrap();
-            for i in 0..cells.d {
-                let w = want_row[i].as_f64().unwrap() as f32;
+            let want_row = row_t.as_array().unwrap()[r].as_array().unwrap();
+            for (i, want) in want_row.iter().enumerate().take(cells.d) {
+                let w = want.as_f64().unwrap() as f32;
                 let g = cells.data[(t * cells.rows + r) * cells.d + i];
                 worst_ca = worst_ca.max((w - g).abs());
             }

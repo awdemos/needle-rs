@@ -45,14 +45,15 @@ pub struct Needle {
 impl Needle {
     /// Create an agent. `weights` is a `.cact` archive (e.g. the published
     /// `needle3.cact`); `tools` are raw JSON Schemas; `system` is the optional
-    /// environment-facts string (a `date:` fact is prepended unless present).
+    /// environment-facts string (a `date:` fact is always prepended unless
+    /// present, mirroring Python's `auto_date=True`).
     pub fn new(weights: &Path, tools: Vec<Value>, system: Option<String>) -> Result<Needle, String> {
         let archive = read_archive(weights).map_err(|e| e.to_string())?;
         let model = Model::from_archive(&archive).map_err(|e| e.to_string())?;
         let tokenizer = Tokenizer::from_blob(archive.tokenizer_blob().ok_or("no tokenizer in archive")?)
             .map_err(|e| e.to_string())?;
         let tool_schemas = tools.clone();
-        let system = system.map(|s| with_date_fact(&s));
+        let system = dated_system(system);
         Ok(Needle {
             cache: model.new_cache(),
             model,
@@ -117,18 +118,17 @@ impl Needle {
             let mut results: Vec<Value> = Vec::new();
             for call in &response.function_calls {
                 let name = call.name.clone();
-                let fabricated: Vec<String> = ungrounded
-                    .get(&name)
-                    .map(|s| {
-                        s.iter()
-                            .filter(|p| {
-                                !(strict && grounding::grounded_number_paths(&call.arguments, &[query, self.system.as_deref().unwrap_or("")]))
-                                    || !grounding::path_has_number(&call.arguments, p)
-                            })
-                            .cloned()
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let fabricated: std::collections::BTreeSet<String> =
+                    ungrounded.get(&name).cloned().unwrap_or_default();
+                let fabricated = if strict {
+                    grounding::filter_fabricated(
+                        fabricated,
+                        &call.arguments,
+                        &[query, self.system.as_deref().unwrap_or_default()],
+                    )
+                } else {
+                    fabricated.into_iter().collect()
+                };
                 if strict && !fabricated.is_empty() {
                     results.push(json!({"error": format!("ungrounded {}", fabricated.join(", "))}));
                     continue;
@@ -160,7 +160,8 @@ impl Needle {
             needle_tokenizer::TOOL_RESULT_START,
             needle_tokenizer::TOOL_RESULT_END
         );
-        // Result feedback rides a user turn via the same render path.
+        // Result feedback rides a user turn via the same render path, with the
+        // system block re-attached so follow-up turns keep the environment facts.
         let tools_json = serde_json::to_string(&self.tools).unwrap_or_else(|_| "[]".into());
         let mut response = needle_engine::complete_turn(
             &self.model,
@@ -170,7 +171,7 @@ impl Needle {
             &turn,
             &mut self.cache,
             &mut self.history,
-            None,
+            self.system.as_deref(),
             max_new_tokens,
         )?;
         // The engine prepends the tools block again; that matches the training
@@ -204,9 +205,14 @@ impl Needle {
         let engine = Engine::new(&self.model, self.tokenizer.clone(), vec![tool.clone()]);
         let mut cache = self.model.new_cache();
         let mut history: Vec<u32> = Vec::new();
-        let response = engine
+        let mut response = engine
             .complete_turn(text, &mut cache, &mut history, self.system.as_deref(), max_new_tokens)
             .map_err(ExtractionError::Engine)?;
+        // Python's extract annotates the envelope before validating (its
+        // `_complete` runs with `ground=True`), so date fabrications raised by
+        // the model itself also count as engine-reported flags here.
+        let seen = grounding::source_years(text);
+        grounding::annotate_ungrounded(&mut response, std::slice::from_ref(&tool), &seen, self.system.as_deref(), Some(text));
         let calls = if response.function_calls.is_empty() {
             &response.suppressed_calls
         } else {
@@ -263,6 +269,12 @@ pub fn with_date_fact(system: &str) -> String {
     }
 }
 
+/// `auto_date=True` semantics: the agent always carries a date fact, even
+/// when the caller passes no system string.
+fn dated_system(system: Option<String>) -> Option<String> {
+    Some(with_date_fact(&system.unwrap_or_default()))
+}
+
 fn contains_iso_stamp(s: &str) -> bool {
     // `\d{4}-\d{2}-\d{2}` (date) or `\d{4}-\d{2}-\d{2}T\d{2}:\d{2}` (datetime)
     let b = s.as_bytes();
@@ -279,4 +291,55 @@ fn contains_iso_stamp(s: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn models_dir() -> PathBuf {
+        std::env::var("NEEDLE_MODELS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models"))
+    }
+
+    #[test]
+    fn auto_date_fact_with_no_system() {
+        // `auto_date=True` parity: a missing system string still yields the date fact
+        assert!(dated_system(None).unwrap().starts_with("date: 20"));
+        let s = dated_system(Some("locale: en-US".into())).unwrap();
+        assert!(s.starts_with("date: 20"));
+        assert!(s.ends_with("locale: en-US"));
+        let path = models_dir().join("needle3.cact");
+        if !path.exists() {
+            eprintln!("skip: {} not found", path.display());
+            return;
+        }
+        let agent = Needle::new(&path, Vec::new(), None).unwrap();
+        assert!(
+            agent.system.as_deref().unwrap().starts_with("date: "),
+            "date fact must be injected when system is None"
+        );
+    }
+
+    #[test]
+    fn followup_turn_keeps_system_block() {
+        // bug regression: feed_result must re-attach the system block so the
+        // follow-up render carries the environment facts (and the date fact)
+        let path = models_dir().join("needle3.cact");
+        if !path.exists() {
+            eprintln!("skip: {} not found", path.display());
+            return;
+        }
+        let mut agent = Needle::new(&path, Vec::new(), Some("locale: en-US".into())).unwrap();
+        agent.complete_limited("hello", 64).unwrap();
+        let before = agent.history.len();
+        agent.feed_result("[{\"ok\": true}]", 64).unwrap();
+        let turn = agent.tokenizer.decode(&agent.history[before..]);
+        assert!(
+            turn.contains("locale: en-US"),
+            "follow-up turn lost the system block: {turn}"
+        );
+    }
 }

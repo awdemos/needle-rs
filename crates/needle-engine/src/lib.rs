@@ -100,12 +100,13 @@ impl<'m> Engine<'m> {
         &self.tools_json
     }
 
-    /// Greedy next token (argmax over logits).
+    /// Greedy next token (argmax over logits). NaN-safe total ordering;
+    /// callers verify the winning logit is finite.
     fn argmax(logits: &[f32]) -> usize {
         logits
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .max_by(|a, b| a.1.total_cmp(b.1))
             .map(|(i, _)| i)
             .unwrap_or(0)
     }
@@ -190,6 +191,9 @@ pub fn complete_turn(
         let mut phase1_tokens = 0usize;
         loop {
             let next = Engine::argmax(&logits);
+            if !logits.get(next).is_some_and(|v| v.is_finite()) {
+                return Err("non-finite logits".into());
+            }
             if next == needle_tokenizer::EOS_ID as usize || Some(next as u32) == im_end_id {
                 let free_text = tokenizer.decode(&generated);
                 let reasoning = extract_think(&free_text);
@@ -209,6 +213,9 @@ pub fn complete_turn(
                     validation: None,
                 });
             }
+            if phase1_tokens >= max_new_tokens {
+                return Err("max_new_tokens exceeded before <tool_call>".into());
+            }
             generated.push(next as u32);
             history.push(next as u32);
             phase1_tokens += 1;
@@ -217,16 +224,19 @@ pub fn complete_turn(
             if Some(next as u32) == call_start_id {
                 break;
             }
-            if phase1_tokens >= max_new_tokens {
-                return Err("max_new_tokens exceeded before <tool_call>".into());
-            }
         }
         let free_text = tokenizer.decode(&generated);
         let reasoning = extract_think(&free_text);
 
         // ---- phase 2: grammar-constrained JSON ----
         let mut grammar = Grammar::compile(tools);
-        let vocab = tokenizer.vocab_size();
+        // The grammar reads decoded text, so candidates step the DECODED bytes
+        // of each piece: '▁' reads as a space and "<0xNN>" byte pieces read as
+        // the byte itself (per Tokenizer::decode). Schema strings containing
+        // spaces can only match in this space.
+        let decoded: Vec<Vec<u8>> = (0..tokenizer.vocab_size() as u32)
+            .map(|id| decoded_piece(tokenizer, id))
+            .collect();
         let mut json_tokens: Vec<u32> = Vec::new();
         let mut decode_steps = 0usize;
         loop {
@@ -236,32 +246,30 @@ pub fn complete_turn(
             if decode_steps >= max_new_tokens {
                 return Err("max_new_tokens exceeded inside tool_call".into());
             }
-            // allow tokens whose every byte the grammar accepts
-            let pick = (0..vocab)
+            // allow tokens whose every decoded byte the grammar accepts;
+            // logits are `out_vocab` long and may be shorter than the vocab
+            let pick = (0..logits.len())
                 .into_par_iter()
                 .filter_map(|tid| {
-                    let piece = tokenizer.piece(tid as u32);
-                    if piece.is_empty() {
+                    let bytes = decoded.get(tid)?;
+                    if bytes.is_empty() {
                         return None;
                     }
                     let mut g = grammar.clone();
-                    if piece.bytes().all(|b| g.step(b)) {
+                    if bytes.iter().all(|&b| g.step(b)) {
                         Some((tid, logits[tid]))
                     } else {
                         None
                     }
                 })
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-                .map(|(tid, _)| tid);
-            // note: the grammar is mid-string; opening quote handled per-frame —
-            // the filter above starts each candidate from the CURRENT state.
+                .max_by(|a, b| a.1.total_cmp(&b.1));
             let next = match pick {
-                Some(t) => t,
+                Some((t, v)) if v.is_finite() => t,
+                Some(_) => return Err("non-finite logits".into()),
                 None => return Err("grammar dead-end: no valid token".into()),
             };
-            let piece = tokenizer.piece(next as u32);
             let mut g = grammar.clone();
-            let ok = piece.bytes().all(|b| g.step(b));
+            let ok = decoded[next].iter().all(|&b| g.step(b));
             if !ok {
                 return Err("selected token failed grammar step".into());
             }
@@ -281,16 +289,24 @@ pub fn complete_turn(
         }
         // ---- phase 3: closing </tool_call> (+ optional <|im_end|>) ----
         let mut closing: Vec<u32> = Vec::new();
+        let mut closed = false;
         for _ in 0..4 {
             let next = Engine::argmax(&logits);
+            if !logits.get(next).is_some_and(|v| v.is_finite()) {
+                return Err("non-finite logits".into());
+            }
             closing.push(next as u32);
             generated.push(next as u32);
             history.push(next as u32);
             logits = model.step(next as u32, cache.len, cache, None)
                 .map_err(|e| e.to_string())?;
             if Some(next as u32) == call_end_id || Some(next as u32) == im_end_id {
+                closed = true;
                 break;
             }
+        }
+        if !closed {
+            return Err("missing </tool_call> after tool-call JSON".into());
         }
         let _ = call_region;
 
@@ -305,7 +321,8 @@ pub fn complete_turn(
                     Some(FunctionCall { name, arguments })
                 })
                 .collect(),
-            _ => Vec::new(),
+            Ok(_) => return Err("tool-call region did not decode to a JSON array".into()),
+            Err(e) => return Err(format!("tool-call region is not valid JSON: {e}")),
         };
 
         let confidence = confidence(model, history, &call_logprobs);
@@ -322,7 +339,7 @@ pub fn complete_turn(
             reasoning,
             confidence,
             prefill_tps,
-            decode_tps: (phase1_tokens + decode_steps) as f64
+            decode_tps: (phase1_tokens + decode_steps + closing.len()) as f64
                 / t_decode_start.elapsed().as_secs_f64().max(1e-9),
             results: None,
             validation: None,
@@ -374,6 +391,23 @@ fn extract_think(text: &str) -> String {
     }
 }
 
+/// The bytes a vocabulary id contributes to decoded text, per
+/// [`Tokenizer::decode`]: TK_BYTE pieces decode to the byte itself, control
+/// and unknown pieces decode to nothing, and the SentencePiece marker '▁'
+/// (U+2581) decodes to a space. The grammar steps these decoded bytes so
+/// schema strings with spaces and byte-fallback text can match.
+fn decoded_piece(tokenizer: &Tokenizer, id: u32) -> Vec<u8> {
+    let ty = tokenizer.types[id as usize];
+    if ty == needle_tokenizer::TK_BYTE {
+        let p = tokenizer.piece(id);
+        return u8::from_str_radix(&p[3..5], 16).map(|b| vec![b]).unwrap_or_default();
+    }
+    if ty == needle_tokenizer::TK_CONTROL || ty == needle_tokenizer::TK_UNKNOWN {
+        return Vec::new();
+    }
+    tokenizer.piece(id).replace('\u{2581}', " ").into_bytes()
+}
+
 /// `probe_pool` from `architecture.py`: pooled per-row cells → `[q*d]`.
 pub fn probe_head_rows(
     _model: &Model,
@@ -388,16 +422,16 @@ pub fn probe_head_rows(
     let scale = 1.0 / (d as f32).sqrt();
     // scores[l,k,t] = dot(cells[t,l], probes[l,k]) * scale  (keep = all ones)
     let mut scores = vec![vec![vec![0.0f32; cells.t]; k]; rows];
-    for l in 0..rows {
-        for kk in 0..k {
+    for (l, scores_l) in scores.iter_mut().enumerate().take(rows) {
+        for (kk, scores_lk) in scores_l.iter_mut().enumerate().take(k) {
             let probe = &head.probes[(l * k + kk) * d..(l * k + kk + 1) * d];
-            for t in 0..cells.t {
+            for (t, s) in scores_lk.iter_mut().enumerate().take(cells.t) {
                 let cell = &cells.data[(t * rows + l) * d..(t * rows + l + 1) * d];
                 let mut acc = 0.0f32;
                 for i in 0..d {
                     acc += cell[i] * probe[i];
                 }
-                scores[l][kk][t] = acc * scale;
+                *s = acc * scale;
             }
         }
     }
@@ -409,9 +443,9 @@ pub fn probe_head_rows(
             let mut w: Vec<f64> = sc.iter().map(|&v| v as f64).collect();
             softmax_in_place(&mut w);
             let mut vec_r = vec![0.0f32; d];
-            for t in 0..cells.t {
+            for (t, wt) in w.iter().enumerate().take(cells.t) {
                 let cell = &cells.data[(t * rows + l) * d..(t * rows + l + 1) * d];
-                let wt = w[t] as f32;
+                let wt = *wt as f32;
                 for i in 0..d {
                     vec_r[i] += wt * cell[i];
                 }
@@ -455,13 +489,13 @@ pub fn probe_head_rows(
         // apply proj [out_dim, q*d] + bias
         let out_dim = head.proj.len() / (q * d);
         let mut y = vec![0.0f32; out_dim];
-        for o in 0..out_dim {
+        for (o, y_o) in y.iter_mut().enumerate().take(out_dim) {
             let row = &head.proj[o * q * d..(o + 1) * q * d];
             let mut acc = head.bias.get(o).copied().unwrap_or(0.0);
             for i in 0..q * d {
                 acc += row[i] * out[i];
             }
-            y[o] = acc;
+            *y_o = acc;
         }
         Some(y)
     } else {
@@ -471,4 +505,59 @@ pub fn probe_head_rows(
 
 fn probe_head_forward(model: &Model, head: &needle_model::HeadWeights, cells: &Cells, with_proj: bool) -> Option<Vec<f32>> {
     probe_head_rows(model, head, cells, with_proj)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn models_dir() -> std::path::PathBuf {
+        std::env::var("NEEDLE_MODELS_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models")
+            })
+    }
+
+    /// The mask feeds the grammar DECODED piece bytes: '▁' must read as a
+    /// space (never the raw U+2581 bytes) and TK_BYTE pieces as their byte —
+    /// otherwise schema strings containing a space can never match.
+    #[test]
+    fn decoded_piece_matches_decode_semantics() {
+        let path = models_dir().join("needle3.cact");
+        if !path.exists() {
+            eprintln!("skip: needle3.cact not downloaded");
+            return;
+        }
+        let ar = needle_format::read_archive(&path).unwrap();
+        let tok = Tokenizer::from_blob(ar.tokenizer_blob().unwrap()).unwrap();
+        let mut checked_sp = false;
+        let mut checked_byte = false;
+        for id in 0..tok.vocab_size() as u32 {
+            let bytes = decoded_piece(&tok, id);
+            match tok.types[id as usize] {
+                needle_tokenizer::TK_BYTE => {
+                    let b = u8::from_str_radix(&tok.piece(id)[3..5], 16).unwrap();
+                    assert_eq!(bytes, vec![b], "byte piece {id}");
+                    checked_byte = true;
+                }
+                needle_tokenizer::TK_CONTROL | needle_tokenizer::TK_UNKNOWN => {
+                    assert!(bytes.is_empty(), "control piece {id}");
+                }
+                _ => {
+                    let want = tok.piece(id).replace('\u{2581}', " ").into_bytes();
+                    assert_eq!(bytes, want, "piece {id} {:?}", tok.piece(id));
+                    if tok.piece(id).contains('\u{2581}') {
+                        checked_sp = true;
+                        assert!(
+                            !want.windows(3).any(|w| w == [0xe2, 0x96, 0x81]),
+                            "raw U+2581 bytes leaked into piece {id}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(checked_sp, "expected at least one '▁' piece in the vocab");
+        assert!(checked_byte, "expected TK_BYTE pieces in the vocab");
+    }
 }

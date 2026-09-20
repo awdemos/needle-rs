@@ -1,7 +1,6 @@
 //! Agent-level tests against the real model.
 use needle_agent::Needle;
 use serde_json::{json, Value};
-use std::path::PathBuf;
 
 fn models_dir() -> std::path::PathBuf {
     std::env::var("NEEDLE_MODELS_DIR")

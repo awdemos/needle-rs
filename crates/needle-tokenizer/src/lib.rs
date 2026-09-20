@@ -91,9 +91,12 @@ impl Tokenizer {
         let add_dummy = blob[20] != 0;
         let byte_fallback = blob[21] != 0;
         let mut off = 24;
-        let mut pieces = Vec::with_capacity(n);
-        let mut scores = Vec::with_capacity(n);
-        let mut types = Vec::with_capacity(n);
+        // n is attacker-controlled up to 2^32; cap the preallocation so it
+        // cannot abort before the per-record bounds checks run.
+        let cap = n.min(4096);
+        let mut pieces = Vec::with_capacity(cap);
+        let mut scores = Vec::with_capacity(cap);
+        let mut types = Vec::with_capacity(cap);
         for _ in 0..n {
             if blob.len() < off + 7 {
                 return Err(Error::Truncated);
@@ -120,9 +123,13 @@ impl Tokenizer {
             .collect();
         let byte_id: HashMap<u8, u32> = pieces
             .iter()
+            .zip(&types)
             .enumerate()
-            .filter(|(_, p)| p.len() == 6 && p.starts_with("<0x") && p.ends_with('>'))
-            .filter_map(|(i, p)| u8::from_str_radix(&p[3..5], 16).ok().map(|b| (b, i as u32)))
+            // Keyed strictly on the BYTE type, like the Python reference; a
+            // NORMAL piece that merely looks like "<0xHH>" is not byte fallback.
+            .filter(|(_, (_, &t))| t == TK_BYTE)
+            .filter(|(_, (p, _))| p.len() == 6 && p.starts_with("<0x") && p.ends_with('>'))
+            .filter_map(|(i, (p, _))| u8::from_str_radix(&p[3..5], 16).ok().map(|b| (b, i as u32)))
             .collect();
         let mut markers: Vec<String> = pieces
             .iter()
@@ -148,14 +155,24 @@ impl Tokenizer {
         self.pieces.len()
     }
 
+    /// The surface string for `id`. Panics if `id >= vocab_size()`; use
+    /// [`piece_opt`](Self::piece_opt) for ids that may be out of range
+    /// (e.g. model-generated).
     pub fn piece(&self, id: u32) -> &str {
         &self.pieces[id as usize]
+    }
+
+    /// Lossy variant of [`piece`](Self::piece): `None` for out-of-range ids
+    /// instead of a panic.
+    pub fn piece_opt(&self, id: u32) -> Option<&str> {
+        self.pieces.get(id as usize).map(String::as_str)
     }
 
     pub fn piece_id(&self, piece: &str) -> Option<u32> {
         self.p2id.get(piece).copied()
     }
 
+    /// Whether `id` is a BYTE piece. Panics if `id >= vocab_size()`.
     pub fn is_byte(&self, id: u32) -> bool {
         self.types[id as usize] == TK_BYTE
     }
@@ -238,16 +255,26 @@ impl Tokenizer {
     pub fn decode(&self, ids: &[u32]) -> String {
         let mut buf: Vec<u8> = Vec::new();
         for &id in ids {
-            let t = self.types[id as usize];
+            // Ids come from the model and may be out of range: decode lossily.
+            let Some(&t) = self.types.get(id as usize) else {
+                continue;
+            };
             if t == TK_BYTE {
-                let p = &self.pieces[id as usize];
-                if let Ok(b) = u8::from_str_radix(&p[3..5], 16) {
-                    buf.push(b);
+                // Malformed BYTE pieces (short or multibyte surface) are
+                // skipped, like an unparsable hex digit.
+                if let Some(hex) = self
+                    .pieces
+                    .get(id as usize)
+                    .and_then(|p| p.get(3..5))
+                {
+                    if let Ok(b) = u8::from_str_radix(hex, 16) {
+                        buf.push(b);
+                    }
                 }
             } else if t == TK_CONTROL || t == TK_UNKNOWN {
                 continue;
-            } else {
-                buf.extend_from_slice(self.pieces[id as usize].as_bytes());
+            } else if let Some(p) = self.pieces.get(id as usize) {
+                buf.extend_from_slice(p.as_bytes());
             }
         }
         let mut text = String::from_utf8_lossy(&buf).into_owned();

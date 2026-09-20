@@ -10,6 +10,9 @@ use half::f16;
 use std::fmt;
 
 pub const TAG_V3: u32 = 0x05E12A84;
+/// The Needle 2 generation tag. V2 archives use a different layout handled by a
+/// different engine generation (see Python `_CACT_GENERATIONS`); this reader
+/// rejects them with [`Error::UnsupportedVersion`].
 pub const TAG_V2: u32 = 0x05E12A83;
 pub const ALIGN: usize = 64;
 
@@ -34,20 +37,32 @@ pub(crate) const CB4: usize = 16;
 #[derive(Debug)]
 pub enum Error {
     BadTag(u32),
+    /// A recognized but unsupported archive generation (V2).
+    UnsupportedVersion(u32),
+    /// The archive file could not be read at all (missing, permissions, ...).
+    Io(std::io::Error),
     Truncated(&'static str),
     BadDtype(u8),
     BadBits(u32),
     BadShape,
+    /// A header/record field is outside the range the format can encode.
+    BadGeometry(&'static str),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::BadTag(t) => write!(f, "bad archive tag 0x{t:08x}"),
+            Error::UnsupportedVersion(t) => write!(
+                f,
+                "unsupported archive version (tag 0x{t:08x}); this reader only supports .cact V3"
+            ),
+            Error::Io(e) => write!(f, "cannot read archive: {e}"),
             Error::Truncated(what) => write!(f, "truncated archive: {what}"),
             Error::BadDtype(d) => write!(f, "unsupported record dtype {d}"),
             Error::BadBits(b) => write!(f, "unsupported CQ width bits={b}"),
             Error::BadShape => write!(f, "record shape/ndim mismatch"),
+            Error::BadGeometry(what) => write!(f, "bad archive geometry: {what}"),
         }
     }
 }
@@ -93,6 +108,7 @@ impl Config {
 
     /// `_hada_blocks`: split `n` into (ba, bb) Kronecker factors.
     pub fn hada_blocks(n: usize) -> (usize, usize) {
+        let n = n.max(1); // a corrupt hada_n = 0 must not underflow
         let bits = (usize::BITS - (n - 1).leading_zeros()) as usize;
         let b = 1usize << (bits / 2);
         (b, n / b)
@@ -155,7 +171,7 @@ fn le_u64(raw: &[u8], at: usize) -> u64 {
 }
 
 pub fn read_archive(path: &std::path::Path) -> Result<Archive> {
-    let raw = std::fs::read(path).map_err(|_| Error::Truncated("file read"))?;
+    let raw = std::fs::read(path).map_err(Error::Io)?;
     read_archive_from(raw)
 }
 
@@ -164,7 +180,10 @@ pub fn read_archive_from(raw: Vec<u8>) -> Result<Archive> {
         return Err(Error::Truncated("header"));
     }
     let tag = le_u32(&raw, 0);
-    if tag != TAG_V3 && tag != TAG_V2 {
+    if tag == TAG_V2 {
+        return Err(Error::UnsupportedVersion(tag));
+    }
+    if tag != TAG_V3 {
         return Err(Error::BadTag(tag));
     }
     let num_tensors = le_u32(&raw, 4) as usize;
@@ -181,12 +200,19 @@ pub fn read_archive_from(raw: Vec<u8>) -> Result<Archive> {
     off += cb_len * 4;
 
     let num_layers = le_u32(&raw, 40) as usize;
+    if num_layers > 64 {
+        // The header's global_mask holds 64 layers; a larger count would both
+        // wrap the `(gmask >> i)` shifts and spin for billions of iterations.
+        return Err(Error::BadGeometry("global_mask holds at most 64 layers"));
+    }
     let gmask = le_u32(&raw, 68) as u64 | ((le_u32(&raw, 72) as u64) << 32);
     let global_layers = (0..num_layers).filter(|&i| (gmask >> i) & 1 == 1).collect();
+    // The header has fixed 4-order / 16-site slots; larger counts are capped
+    // like the Python reader slices `orders4[:num_orders]`.
     let num_orders = le_u32(&raw, 104) as usize;
-    let engram_orders: Vec<usize> = (0..num_orders).map(|i| le_u32(&raw, 108 + i * 4) as usize).collect();
+    let engram_orders: Vec<usize> = (0..num_orders.min(4)).map(|i| le_u32(&raw, 108 + i * 4) as usize).collect();
     let num_sites = le_u32(&raw, 124) as usize;
-    let engram_layers: Vec<usize> = (0..num_sites).map(|i| le_u32(&raw, 128 + i * 4) as usize).collect();
+    let engram_layers: Vec<usize> = (0..num_sites.min(16)).map(|i| le_u32(&raw, 128 + i * 4) as usize).collect();
 
     let config = Config {
         vocab_size: le_u32(&raw, 20) as usize,
@@ -216,8 +242,10 @@ pub fn read_archive_from(raw: Vec<u8>) -> Result<Archive> {
         kv_bits,
     };
 
-    let mut records = Vec::with_capacity(num_tensors);
-    let mut tensors = Vec::with_capacity(num_tensors);
+    // Cap the reservation: num_tensors is attacker-controlled up to 2^32 and
+    // must not abort the process before the per-record bounds checks run.
+    let mut records: Vec<Record> = Vec::with_capacity(num_tensors.min(4096));
+    let mut tensors: Vec<Tensor> = Vec::with_capacity(num_tensors.min(4096));
     for _ in 0..num_tensors {
         if raw.len() < off + REC_LEN {
             return Err(Error::Truncated("directory"));
@@ -242,8 +270,10 @@ pub fn read_archive_from(raw: Vec<u8>) -> Result<Archive> {
         let tensor = match dtype {
             DTYPE_FP16 => {
                 let data: Vec<f32> = blob
-                    .chunks_exact(2)
-                    .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| f16::from_le_bytes(*c).to_f32())
                     .collect();
                 Tensor::Fp16 {
                     shape: shape.clone(),
@@ -252,8 +282,10 @@ pub fn read_archive_from(raw: Vec<u8>) -> Result<Archive> {
             }
             DTYPE_FP32 => {
                 let data: Vec<f32> = blob
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect();
                 Tensor::Fp32 {
                     shape: shape.clone(),
@@ -264,19 +296,36 @@ pub fn read_archive_from(raw: Vec<u8>) -> Result<Archive> {
                 if shape.len() != 2 {
                     return Err(Error::BadShape);
                 }
+                // Valid widths are {1, 2, 3, 4, 5}; anything else would overflow
+                // `in_pad * bits` / `1u64 << bits` downstream.
+                if !matches!(bits, 1..=5) {
+                    return Err(Error::BadBits(bits));
+                }
                 let out = shape[0];
                 let inp = shape[1];
                 let g = group_size as usize;
+                // group_size must divide evenly for the norms check and be a
+                // power of two for the Hadamard transform in `dequant_cq`.
+                if g == 0 {
+                    return Err(Error::BadGeometry("CQ group_size must be >= 1"));
+                }
+                if !g.is_power_of_two() {
+                    return Err(Error::BadGeometry("CQ group_size must be a power of two"));
+                }
                 let in_pad = inp.div_ceil(g) * g;
-                let n_packed = out * packed_row_bytes(in_pad, bits);
+                let n_packed = out
+                    .checked_mul(packed_row_bytes(in_pad, bits))
+                    .ok_or(Error::Truncated("cq packed"))?;
                 if blob.len() < n_packed {
                     return Err(Error::Truncated("cq packed"));
                 }
                 let norms: Vec<f16> = blob[n_packed..]
-                    .chunks_exact(2)
-                    .map(|c| f16::from_le_bytes([c[0], c[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| f16::from_le_bytes(*c))
                     .collect();
-                if norms.len() != out * (in_pad / g) {
+                if norms.len() != out.checked_mul(in_pad / g).ok_or(Error::Truncated("cq norms"))? {
                     return Err(Error::Truncated("cq norms"));
                 }
                 Tensor::Cq(CqMatrix {
@@ -360,12 +409,19 @@ pub fn binary_codebook(group: usize) -> Vec<f32> {
 
 impl Archive {
     /// Codebook for a logical width: header cb2/cb3/cb4 for 2/3/4, analytic for
-    /// 1 (binary) and ternary crumbs (record bits == 5).
+    /// 1 (binary) and ternary crumbs (record bits == 5). Errs on short books
+    /// instead of silently truncating.
     pub fn codebook_for(&self, bits: u32, group: usize) -> Result<Vec<f32>> {
+        let header_book = |start: usize, len: usize| -> Result<Vec<f32>> {
+            if self.codebook.len() < start + len {
+                return Err(Error::BadGeometry("codebook too short for this CQ width"));
+            }
+            Ok(self.codebook[start..start + len].to_vec())
+        };
         match bits {
-            2 => Ok(self.codebook[..CB2.min(self.codebook.len())].to_vec()),
-            3 => Ok(self.codebook[CB2..(CB2 + CB3).min(self.codebook.len())].to_vec()),
-            4 => Ok(self.codebook[(CB2 + CB3).min(self.codebook.len())..].to_vec()),
+            2 => header_book(0, CB2),
+            3 => header_book(CB2, CB3),
+            4 => header_book(CB2 + CB3, CB4),
             1 => Ok(binary_codebook(group)),
             TERNARY_RECORD_BITS => Ok(ternary_codebook(group)),
             other => Err(Error::BadBits(other)),
@@ -432,7 +488,14 @@ pub fn fwht(x: &mut [f32]) {
 /// Dequantize a CQ matrix to row-major f32 `[out, inp]`:
 /// `w_group = (codebook[idx] * norm) @ H` per group.
 pub fn dequant_cq(mat: &CqMatrix, codebook: &[f32]) -> Result<Vec<f32>> {
+    // Re-validate: `mat` may come from anywhere, not just `read_archive_from`.
+    if !matches!(mat.bits, 1..=5) {
+        return Err(Error::BadBits(mat.bits));
+    }
     let g = mat.group_size;
+    if g == 0 || !g.is_power_of_two() {
+        return Err(Error::BadGeometry("CQ group_size must be a power of two >= 1"));
+    }
     let in_pad = mat.in_pad();
     let idx = if mat.bits == TERNARY_RECORD_BITS {
         let crumbs = unpack_lsb(&mat.packed, 2, mat.out, in_pad);
@@ -451,7 +514,11 @@ pub fn dequant_cq(mat: &CqMatrix, codebook: &[f32]) -> Result<Vec<f32>> {
             let norm = mat.norms[row * groups_per_row + gr].to_f32();
             let base = row * in_pad + gr * g;
             for k in 0..g {
-                tmp[k] = codebook[idx[row * in_pad + gr * g + k] as usize] * norm;
+                let ci = idx[row * in_pad + gr * g + k] as usize;
+                let c = codebook
+                    .get(ci)
+                    .ok_or(Error::BadGeometry("codebook index out of range"))?;
+                tmp[k] = c * norm;
             }
             fwht(&mut tmp);
             w[base..base + g].copy_from_slice(&tmp);
@@ -525,8 +592,8 @@ mod tests {
         let bits = 4u32;
         let idx: Vec<u8> = (0..(out * in_pad) as u8).map(|i| i % 16).collect();
         let mut packed = vec![0u8; out * in_pad * bits as usize / 8];
-        for i in 0..idx.len() {
-            let v = idx[i] as u64;
+        for (i, &iv) in idx.iter().enumerate() {
+            let v = iv as u64;
             let bitpos = i * bits as usize;
             for j in 0..bits as usize {
                 if (v >> j) & 1 == 1 {
@@ -571,8 +638,8 @@ mod tests {
                 fwht(&mut rot);
                 let norm: f32 = rot.iter().map(|v| v * v).sum::<f32>().sqrt();
                 norms[row * (in_pad / g) + gr] = f16::from_f32(norm);
-                for k in 0..g {
-                    let unit = rot[k] / norm.max(1e-12);
+                for (k, &rv) in rot.iter().enumerate() {
+                    let unit = rv / norm.max(1e-12);
                     let mut best = 0usize;
                     let mut bd = f32::MAX;
                     for (ci, &c) in cb.iter().enumerate() {

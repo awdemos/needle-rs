@@ -1,7 +1,7 @@
 use needle_build::Checkpoint;
 
 fn main() {
-    let mut ckpt = Checkpoint::load(std::path::Path::new("models/needle3.safetensors")).unwrap();
+    let ckpt = Checkpoint::load(std::path::Path::new("models/needle3.safetensors")).unwrap();
     let ar = needle_format::read_archive(std::path::Path::new("models/needle3.cact")).unwrap();
     let blob = ar.tokenizer_blob().unwrap().to_vec();
     ckpt.write_cact(std::path::Path::new("models/needle3-rebuilt.cact"), Some(&blob), 4, 128).unwrap();

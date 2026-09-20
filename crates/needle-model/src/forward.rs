@@ -1,7 +1,13 @@
 //! Incremental SAN forward pass: one unified single-position `step` drives both
-//! prefill and decode. Cross-time state lives in `Cache` (attention KV in int8
-//! per the archive's `kv_bits`, causal conv tap rings, engram raw-value rings,
-//! and the short token window the engram hash reads).
+//! prefill and decode. Cross-time state lives in `Cache` (attention KV, causal
+//! conv tap rings, engram raw-value rings, and the short token window the
+//! engram hash reads).
+//!
+//! Attention KV is cached in f32 with unit scales, matching the JAX reference
+//! and the shipped checkpoint's training path. The archive header's `kv_bits`
+//! and `kv_window` fields are parsed into `Config` but currently unused here —
+//! int8 KV caching with windowed eviction is a deployed-engine memory
+//! optimization layered on top, not part of this port's numerics.
 
 use crate::ops::*;
 use crate::{engram_indices, Config, Error, Model, Result};
@@ -200,8 +206,17 @@ impl Model {
         mut cells: Option<&mut Cells>,
     ) -> Result<Vec<f32>> {
         let cfg = &self.config;
+        // `step` appends exactly one position to the cache; anything other than
+        // the next contiguous position would silently desync the position→slot
+        // mapping (or index past the KV rows), so refuse it up front.
+        if pos != cache.len {
+            return Err(Error::Shape("non-contiguous position: expected cache.len"));
+        }
         if pos >= cfg.max_seq_len {
             return Err(Error::Shape("sequence position exceeds max_seq_len"));
+        }
+        if token as usize >= cfg.vocab_size {
+            return Err(Error::Shape("token id out of range"));
         }
         let d = cfg.d_model;
         let n = cfg.mhc_lanes;
@@ -215,11 +230,8 @@ impl Model {
         let etaps = cfg.engram_conv_taps;
         let dil = max(cfg.engram_conv_dilation, 1);
         let orders_n = cfg.engram_orders.len();
-        let heads = if orders_n > 0 {
-            cfg.num_engram_tables / orders_n
-        } else {
-            0
-        };
+        // from_archive rejects num_engram_tables not divisible by orders_n.
+        let heads = cfg.num_engram_tables.checked_div(orders_n).unwrap_or(0);
         let num_tables = cfg.num_engram_tables;
         let sub = cfg.engram_sub_dim;
         let table_dim = num_tables * sub;
@@ -246,9 +258,7 @@ impl Model {
             let win = max_order; // window length incl. current
             let mut idx_window = vec![0u32; win];
             let hist = cache.tok_ring.len();
-            for j in 0..hist {
-                idx_window[j] = cache.tok_ring[j];
-            }
+            idx_window[..hist].copy_from_slice(&cache.tok_ring[..hist]);
             idx_window[hist] = token;
             let idx = engram_indices(
                 &idx_window,
@@ -285,8 +295,10 @@ impl Model {
                         }
                     }
                 }
-                {
-                    let ring_len = cache.ev_raw[s].len() / d;
+                // with engram_conv_taps <= 1 there is no history ring, exactly
+                // like the attention conv rings below
+                let ring_len = cache.ev_raw[s].len() / d;
+                if ring_len > 0 {
                     let slot = pos % ring_len;
                     cache.ev_raw[s][slot * d..(slot + 1) * d].copy_from_slice(&b.v_tmp[..d]);
                 }
@@ -309,8 +321,8 @@ impl Model {
                         ss += v * v;
                     }
                     let inv = 1.0 / (ss / n_c as f32 + EPS).sqrt();
-                    for i in 0..n_c {
-                        b.nx[i] = stream[i] * inv;
+                    for (i, &v) in stream.iter().enumerate() {
+                        b.nx[i] = v * inv;
                     }
                 }
                 {
@@ -341,8 +353,8 @@ impl Model {
                 for lane_i in 0..n {
                     let w = b.hpre[lane_i];
                     let seg = &stream[lane_i * d..(lane_i + 1) * d];
-                    for i in 0..d {
-                        b.u[i] += w * seg[i];
+                    for (i, &sv) in seg.iter().enumerate() {
+                        b.u[i] += w * sv;
                     }
                 }
 
@@ -409,8 +421,8 @@ impl Model {
                 .for_each(|(vi, y)| {
                     let row = &self.embedding[vi * d..(vi + 1) * d];
                     let mut acc = 0.0f32;
-                    for i in 0..d {
-                        acc += row[i] * b.tmp[i];
+                    for (i, &tv) in b.tmp[..d].iter().enumerate() {
+                        acc += row[i] * tv;
                     }
                     *y = acc;
                 });
@@ -444,13 +456,13 @@ impl Model {
                 // rms_unit(ek) into k_tmp
                 rms_unit(ek, EPS, &mut b.k_tmp[..d]);
                 let mut dot = 0.0f32;
-                for i in 0..d {
-                    dot += xu[i] * b.k_tmp[i];
+                for (i, &xv) in xu.iter().enumerate() {
+                    dot += xv * b.k_tmp[i];
                 }
                 let alpha = sigmoid(dot / (d as f32).sqrt());
                 let ev = &b.ev[s * d..(s + 1) * d];
-                for i in 0..d {
-                    b.x[i] += alpha * ev[i];
+                for (i, &evv) in ev.iter().enumerate() {
+                    b.x[i] += alpha * evv;
                 }
             }
         }
@@ -471,8 +483,8 @@ impl Model {
         zc_rms_norm(&b.x[..d], &lw.pre_hada, EPS, &mut b.tmp[..d]);
         let xin: Vec<f32> = b.tmp[..d].to_vec();
         self.hadamard(lw, &xin, b)?;
-        for i in 0..d {
-            b.y[i] = (b.x[i] + b.hada[i]) - u[i];
+        for (i, &uv) in u.iter().enumerate() {
+            b.y[i] = (b.x[i] + b.hada[i]) - uv;
         }
         Ok(())
     }
@@ -549,26 +561,26 @@ impl Model {
         // q/k norm (per head over qh) + rope
         for hh in 0..h {
             let qseg = &mut b.q[hh * qh..(hh + 1) * qh];
-            let mut normed = [0.0f32; 64];
-            zc_rms_norm(qseg, &lw.q_norm, EPS, &mut normed[..qh]);
-            qseg.copy_from_slice(&normed[..qh]);
+            let mut normed = vec![0.0f32; qh];
+            zc_rms_norm(qseg, &lw.q_norm, EPS, &mut normed);
+            qseg.copy_from_slice(&normed);
         }
         for kk in 0..kvh {
             let kseg = &mut b.k[kk * qh..(kk + 1) * qh];
-            let mut normed = [0.0f32; 64];
-            zc_rms_norm(kseg, &lw.k_norm, EPS, &mut normed[..qh]);
-            kseg.copy_from_slice(&normed[..qh]);
+            let mut normed = vec![0.0f32; qh];
+            zc_rms_norm(kseg, &lw.k_norm, EPS, &mut normed);
+            kseg.copy_from_slice(&normed);
         }
         let rope = &self.rope;
         for hh in 0..h {
-            let mut out = [0.0f32; 64];
-            rope.apply(&b.q[hh * qh..(hh + 1) * qh], pos, &mut out[..qh]);
-            b.qn[hh * qh..(hh + 1) * qh].copy_from_slice(&out[..qh]);
+            let mut out = vec![0.0f32; qh];
+            rope.apply(&b.q[hh * qh..(hh + 1) * qh], pos, &mut out);
+            b.qn[hh * qh..(hh + 1) * qh].copy_from_slice(&out);
         }
         for kk in 0..kvh {
-            let mut out = [0.0f32; 64];
-            rope.apply(&b.k[kk * qh..(kk + 1) * qh], pos, &mut out[..qh]);
-            b.kn[kk * qh..(kk + 1) * qh].copy_from_slice(&out[..qh]);
+            let mut out = vec![0.0f32; qh];
+            rope.apply(&b.k[kk * qh..(kk + 1) * qh], pos, &mut out);
+            b.kn[kk * qh..(kk + 1) * qh].copy_from_slice(&out);
         }
 
         // cache current k/v (post conv + norm + rope) as f32: the JAX reference and
@@ -600,18 +612,18 @@ impl Model {
                     b.d_k[kk * qh + i] = kq[kk * qh + i] * kscales[kk];
                 }
             }
-            for hh in 0..h {
+            for (hh, sc) in scores.iter_mut().enumerate() {
                 let kk = hh / group;
                 let mut dot = 0.0f32;
                 for i in 0..qh {
                     dot += b.qn[hh * qh + i] * b.d_k[kk * qh + i];
                 }
-                scores[hh][si] = dot * scale;
+                sc[si] = dot * scale;
             }
         }
-        for hh in 0..h {
+        for (hh, sc) in scores.iter().enumerate() {
             let kk = hh / group;
-            let w = softmax(&scores[hh]);
+            let w = softmax(sc);
             for i in 0..vh {
                 b.attn_out[hh * vh + i] = 0.0;
             }
@@ -649,25 +661,25 @@ impl Model {
 
         // cond = 1 + softmax(x @ cond_v) @ cond_u  → kept in b.cond [n_hada]
         let mut logits = [0.0f32; 8];
-        for r in 0..rank {
+        for (r, slot) in logits.iter_mut().enumerate().take(rank) {
             let mut acc = 0.0f32;
-            for i in 0..d {
-                acc += x[i] * lw.cond_v[i * rank + r];
+            for (i, &xv) in x.iter().enumerate() {
+                acc += xv * lw.cond_v[i * rank + r];
             }
-            logits[r] = acc;
+            *slot = acc;
         }
         let sm = softmax(&logits);
         for j in 0..n_hada {
             let mut acc = 0.0f32;
-            for r in 0..rank {
-                acc += sm[r] * lw.cond_u[r * n_hada + j];
+            for (r, &smv) in sm.iter().enumerate().take(rank) {
+                acc += smv * lw.cond_u[r * n_hada + j];
             }
             b.cond[j] = 1.0 + acc;
         }
         // z = pad(x) to n_hada, d1 * z
-        for j in 0..n_hada {
+        for (j, &d1j) in lw.d1.iter().enumerate().take(n_hada) {
             let xv = if j < d { x[j] } else { 0.0 };
-            b.hada[j] = lw.d1[j] * xv;
+            b.hada[j] = d1j * xv;
         }
         // kron with (w1a, w1b), then permute p1
         kron_apply(&mut b.hada[..n_hada], ba, bb, &lw.w1a, &lw.w1b);

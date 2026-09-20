@@ -7,8 +7,10 @@
 //!
 //! Guarantees: well-formed JSON in the trained shape — call objects with a
 //! `name` (one of the declared tools) and `arguments` matching the schema
-//! (required keys present, value types, string enums). Numeric ranges, string
-//! patterns and container sizes are NOT enforced (validate post-hoc).
+//! (required keys present, value types, string enums). Objects with no
+//! declared properties (or truthy `additionalProperties`) are free-form: any
+//! key is accepted and its value parses as unrestricted JSON. Numeric ranges,
+//! string patterns and container sizes are NOT enforced (validate post-hoc).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -18,6 +20,9 @@ pub struct ToolSpec {
     pub name: String,
     pub props: Vec<(String, VSpec)>,
     pub required: BTreeSet<String>,
+    /// free-form arguments object (no declared properties, or
+    /// `additionalProperties` set): undeclared keys are accepted
+    pub additional: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -27,21 +32,42 @@ pub enum VSpec {
     Num,
     Bool,
     Arr { items: Box<VSpec>, max_items: Option<usize> },
-    Obj { props: Vec<(String, VSpec)>, required: BTreeSet<String> },
+    Obj { props: Vec<(String, VSpec)>, required: BTreeSet<String>, additional: bool },
     Any,
 }
 
-type ObjRc = Arc<(Vec<(String, VSpec)>, BTreeSet<String>)>;
+/// An object schema shared by the object value frames.
+#[derive(Debug, Clone)]
+struct ObjSpec {
+    props: Vec<(String, VSpec)>,
+    required: BTreeSet<String>,
+    /// free-form object (no declared properties, or `additionalProperties`
+    /// set): undeclared keys are accepted with unrestricted JSON values
+    additional: bool,
+}
 
-/// What a completed value frame turns into.
+type ObjRc = Arc<ObjSpec>;
+
+/// What a completed value frame turns into. Argument keys ride inside the
+/// continuation (not in shared parse state) so nested objects cannot
+/// clobber the key an outer value still needs to record.
 #[derive(Debug, Clone)]
 enum Cont {
-    /// an argument value in the current tool's arguments object
-    Arg,
+    /// an argument value in the current tool's arguments object; carries the key
+    Arg { key: String },
     /// an array element; carries the parent array state and the array's own cont
     ArrItem { items: Box<VSpec>, max: Option<usize>, count: usize, cont: Box<Cont> },
     /// an object value; carries parent object state + key to record
     ObjValue { spec: ObjRc, seen: BTreeSet<String>, key: String, cont: Box<Cont> },
+}
+
+/// Escape state inside a string value: plain, just after `\`, or mid-`\uXXXX`
+/// (`n` hex digits read so far).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrEsc {
+    None,
+    Esc,
+    Hex { val: u32, n: u8 },
 }
 
 #[derive(Debug, Clone)]
@@ -62,9 +88,12 @@ enum Frame {
     CallArgsColon,
     /// expecting '{' to open the arguments object
     ArgsOpen,
+    /// after '{': the first property key or '}' (empty arguments object)
+    ArgsFirst,
     /// reading a property-name string (prefix-matched against the tool's props)
     ArgsKey { buf: String, in_str: bool },
-    ArgsColon,
+    /// expecting ':' after a key; carries the key + its value spec
+    ArgsColon { key: String, spec: VSpec },
     /// after an argument value: ',' (next key) or '}' (close arguments)
     ArgsNext,
     /// after the arguments object: '}' closes the call object
@@ -73,8 +102,8 @@ enum Frame {
     CallEnd,
     Done,
     // ---- value frames (all carry their continuation) ----
-    VStr { open: bool, esc: bool, en: Option<Arc<Vec<String>>>, sbuf: Vec<u8>, cont: Cont },
-    VInt { minus: bool, digits: usize, cont: Cont },
+    VStr { open: bool, esc: StrEsc, en: Option<Arc<Vec<String>>>, sbuf: Vec<u8>, cont: Cont },
+    VInt { minus: bool, digits: usize, zero: bool, cont: Cont },
     VNum(Num, Cont),
     VBool { branch: Option<bool>, pos: usize, cont: Cont },
     VAny { kind: AnyKind, cont: Cont },
@@ -82,7 +111,8 @@ enum Frame {
     VArrNext { items: Box<VSpec>, max: Option<usize>, count: usize, cont: Cont },
     VObjFirst { spec: ObjRc, cont: Cont },
     VObjKey { spec: ObjRc, seen: BTreeSet<String>, buf: String, in_str: bool, cont: Cont },
-    VObjColon { spec: ObjRc, seen: BTreeSet<String>, cont: Cont },
+    /// expecting ':' after a key; carries the key + its value spec
+    VObjColon { spec: ObjRc, seen: BTreeSet<String>, key: String, vspec: VSpec, cont: Cont },
     VObjNext { spec: ObjRc, seen: BTreeSet<String>, cont: Cont },
 }
 
@@ -90,6 +120,8 @@ enum Frame {
 struct Num {
     minus: bool,
     int_digits: usize,
+    /// the int part is a single leading '0' (no further int digits allowed)
+    lead_zero: bool,
     dot: bool,
     frac_digits: usize,
     exp: bool,
@@ -102,6 +134,7 @@ enum AnyKind {
     Start,
     Str { esc: bool },
     Num(Num),
+    Null { pos: u8 },
 }
 
 impl VSpec {
@@ -147,7 +180,13 @@ impl VSpec {
                         }
                     }
                 }
-                VSpec::Obj { props, required }
+                // objects with no declared properties (or truthy
+                // additionalProperties) accept arbitrary keys
+                let additional = props.is_empty()
+                    || obj
+                        .and_then(|o| o.get("additionalProperties"))
+                        .is_some_and(|v| v.as_bool() != Some(false));
+                VSpec::Obj { props, required, additional }
             }
             _ => VSpec::Str {
                 en: None,
@@ -165,20 +204,29 @@ pub struct Grammar {
     tools: Vec<ToolSpec>,
     frames: Vec<Frame>,
     cur_tool: usize,
-    /// property key completed by ArgsKey / VObjKey, awaiting ':' then value
-    pending: Option<(String, VSpec)>,
+    /// keys recorded so far in the current tool's arguments object
     args_seen: BTreeSet<String>,
 }
 
 fn value_frame(spec: &VSpec, cont: Cont) -> Frame {
     match spec {
-        VSpec::Str { en, .. } => Frame::VStr { open: false, esc: false, en: en.clone(), sbuf: Vec::new(), cont },
-        VSpec::Int => Frame::VInt { minus: false, digits: 0, cont },
+        VSpec::Str { en, .. } => Frame::VStr {
+            open: false,
+            esc: StrEsc::None,
+            en: en.clone(),
+            sbuf: Vec::new(),
+            cont,
+        },
+        VSpec::Int => Frame::VInt { minus: false, digits: 0, zero: false, cont },
         VSpec::Num => Frame::VNum(Num::default(), cont),
         VSpec::Bool => Frame::VBool { branch: None, pos: 0, cont },
         VSpec::Arr { items, max_items } => Frame::VArrFirst { items: items.clone(), max: *max_items, cont },
-        VSpec::Obj { props, required } => Frame::VObjFirst {
-            spec: Arc::new((props.clone(), required.clone())),
+        VSpec::Obj { props, required, additional } => Frame::VObjFirst {
+            spec: Arc::new(ObjSpec {
+                props: props.clone(),
+                required: required.clone(),
+                additional: *additional,
+            }),
             cont,
         },
         VSpec::Any => Frame::VAny { kind: AnyKind::Start, cont },
@@ -193,6 +241,13 @@ fn step_num(nm: &mut Num, byte: u8) -> bool {
             } else if nm.dot {
                 nm.frac_digits += 1;
             } else {
+                // no leading zeros: a '0' int part may not take more digits
+                if nm.lead_zero {
+                    return false;
+                }
+                if nm.int_digits == 0 && byte == b'0' {
+                    nm.lead_zero = true;
+                }
                 nm.int_digits += 1;
             }
             true
@@ -210,8 +265,35 @@ fn step_num(nm: &mut Num, byte: u8) -> bool {
         }
         b'+' => nm.exp && nm.exp_digits == 0 && !nm.exp_sign && replace(&mut nm.exp_sign, true),
         b'.' => !nm.dot && !nm.exp && nm.int_digits > 0 && replace(&mut nm.dot, true),
-        b'e' | b'E' => !nm.exp && nm.int_digits > 0 && replace(&mut nm.exp, true),
+        b'e' | b'E' => {
+            // an opened fraction must have digits before the exponent starts
+            !nm.exp && nm.int_digits > 0 && (!nm.dot || nm.frac_digits > 0) && replace(&mut nm.exp, true)
+        }
         _ => false,
+    }
+}
+
+/// A JSON number may end only when every part that was opened has digits
+/// (so `1e`, `1.` and bare `-` can never complete).
+fn num_complete(nm: &Num) -> bool {
+    nm.int_digits > 0 && (!nm.dot || nm.frac_digits > 0) && (!nm.exp || nm.exp_digits > 0)
+}
+
+fn hex_val(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Enum-prefix check after appending a (plain or escaped) byte to the
+/// decoded string buffer.
+fn str_ok(en: &Option<Arc<Vec<String>>>, sbuf: &[u8]) -> bool {
+    match en {
+        Some(opts) => opts.iter().any(|o| o.as_bytes().starts_with(sbuf)),
+        None => true,
     }
 }
 
@@ -230,18 +312,17 @@ impl Grammar {
                     .get("parameters")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({"type":"object"}));
-                let (props, required) = match VSpec::from_schema(&params) {
-                    VSpec::Obj { props, required } => (props, required),
-                    _ => (Vec::new(), BTreeSet::new()),
+                let (props, required, additional) = match VSpec::from_schema(&params) {
+                    VSpec::Obj { props, required, additional } => (props, required, additional),
+                    _ => (Vec::new(), BTreeSet::new(), true),
                 };
-                ToolSpec { name, props, required }
+                ToolSpec { name, props, required, additional }
             })
             .collect();
         Grammar {
             tools,
             frames: vec![Frame::ArrOpen],
             cur_tool: usize::MAX,
-            pending: None,
             args_seen: BTreeSet::new(),
         }
     }
@@ -253,10 +334,8 @@ impl Grammar {
     /// The frame a completed value resolves to.
     fn resolve(&mut self, cont: Cont) -> Frame {
         match cont {
-            Cont::Arg => {
-                if let Some((k, _)) = self.pending.take() {
-                    self.args_seen.insert(k);
-                }
+            Cont::Arg { key } => {
+                self.args_seen.insert(key);
                 Frame::ArgsNext
             }
             Cont::ArrItem { items, max, count, cont } => Frame::VArrNext { items, max, count, cont: *cont },
@@ -375,11 +454,33 @@ impl Grammar {
                     Frame::ArgsOpen => {
                         if byte == b'{' {
                             self.args_seen.clear();
-                            self.frames[depth - 1] = Frame::ArgsKey { buf: String::new(), in_str: false };
+                            self.frames[depth - 1] = Frame::ArgsFirst;
                         }
                         byte == b'{'
                     }
+                    Frame::ArgsFirst => match byte {
+                        b'"' => {
+                            self.frames[depth - 1] =
+                                Frame::ArgsKey { buf: String::new(), in_str: true };
+                            true
+                        }
+                        b'}' => {
+                            // empty arguments object: legal only when no
+                            // required keys remain (the trained no-arg shape)
+                            let ok = self
+                                .tools
+                                .get(self.cur_tool)
+                                .map(|t| t.required.iter().all(|r| self.args_seen.contains(r)))
+                                .unwrap_or(true);
+                            if ok {
+                                self.frames[depth - 1] = Frame::CallObjEnd;
+                            }
+                            ok
+                        }
+                        _ => false,
+                    },
                     Frame::ArgsKey { buf, in_str } => {
+                        let (buf, in_str) = (buf.clone(), *in_str);
                         if !in_str {
                             if byte == b'"' {
                                 self.frames[depth - 1] =
@@ -389,22 +490,28 @@ impl Grammar {
                                 false
                             }
                         } else if byte == b'"' {
-                            let t = &self.tools[self.cur_tool];
-                            match t.props.iter().find(|(p, _)| p == buf) {
-                                Some((_, spec)) if !self.args_seen.contains(buf) => {
-                                    self.pending = Some((buf.clone(), spec.clone()));
-                                    self.frames[depth - 1] = Frame::ArgsColon;
-                                    true
-                                }
-                                _ => false,
+                            if self.args_seen.contains(&buf) {
+                                return false;
                             }
+                            let tool = &self.tools[self.cur_tool];
+                            let spec =
+                                tool.props.iter().find(|(p, _)| p == &buf).map(|(_, s)| s.clone());
+                            let spec = match spec {
+                                Some(s) => s,
+                                None if tool.additional => VSpec::Any,
+                                None => return false,
+                            };
+                            self.frames[depth - 1] = Frame::ArgsColon { key: buf, spec };
+                            true
                         } else if byte < 0x20 {
                             false
                         } else {
                             let mut nb = buf.clone();
                             nb.push(byte as char);
-                            let t = &self.tools[self.cur_tool];
-                            if t.props.iter().any(|(p, _)| p.starts_with(nb.as_str())) {
+                            let tool = &self.tools[self.cur_tool];
+                            if tool.props.iter().any(|(p, _)| p.starts_with(nb.as_str()))
+                                || tool.additional
+                            {
                                 self.frames[depth - 1] = Frame::ArgsKey { buf: nb, in_str: true };
                                 true
                             } else {
@@ -412,17 +519,19 @@ impl Grammar {
                             }
                         }
                     }
-                    Frame::ArgsColon => {
+                    Frame::ArgsColon { key, spec } => {
                         if byte == b':' {
-                            let spec =
-                                self.pending.as_ref().map(|(_, s)| s.clone()).unwrap_or(VSpec::Any);
-                            self.frames[depth - 1] = value_frame(&spec, Cont::Arg);
+                            // the key rides in the continuation so nested
+                            // objects cannot overwrite it before it records
+                            self.frames[depth - 1] =
+                                value_frame(spec, Cont::Arg { key: key.clone() });
                         }
                         byte == b':'
                     }
                     Frame::ArgsNext => match byte {
                         b',' => {
-                            self.frames[depth - 1] = Frame::ArgsKey { buf: String::new(), in_str: false };
+                            self.frames[depth - 1] =
+                                Frame::ArgsKey { buf: String::new(), in_str: false };
                             true
                         }
                         b'}' => {
@@ -463,72 +572,155 @@ impl Grammar {
                             (*open, *esc, en.clone(), sbuf.clone(), cont.clone());
                         if !open {
                             if byte == b'"' {
-                                self.frames[depth - 1] =
-                                    Frame::VStr { open: true, esc: false, en, sbuf, cont };
+                                self.frames[depth - 1] = Frame::VStr {
+                                    open: true,
+                                    esc: StrEsc::None,
+                                    en,
+                                    sbuf,
+                                    cont,
+                                };
                                 return true;
                             }
                             return false;
                         }
-                        if esc {
-                            let ok = matches!(
-                                byte,
-                                b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' | b'u'
-                            );
-                            if ok {
-                                self.frames[depth - 1] =
-                                    Frame::VStr { open: true, esc: false, en, sbuf, cont };
+                        if let StrEsc::Esc = esc {
+                            // the escaped byte joins the decoded buffer, so
+                            // enums and strings compare in decoded space
+                            let decoded_byte: u8 = match byte {
+                                b'"' => b'"',
+                                b'\\' => b'\\',
+                                b'/' => b'/',
+                                b'b' => 0x08,
+                                b'f' => 0x0c,
+                                b'n' => b'\n',
+                                b'r' => b'\r',
+                                b't' => b'\t',
+                                b'u' => {
+                                    self.frames[depth - 1] = Frame::VStr {
+                                        open: true,
+                                        esc: StrEsc::Hex { val: 0, n: 0 },
+                                        en,
+                                        sbuf,
+                                        cont,
+                                    };
+                                    return true;
+                                }
+                                _ => return false,
+                            };
+                            sbuf.push(decoded_byte);
+                            if str_ok(&en, &sbuf) {
+                                self.frames[depth - 1] = Frame::VStr {
+                                    open: true,
+                                    esc: StrEsc::None,
+                                    en,
+                                    sbuf,
+                                    cont,
+                                };
+                                true
+                            } else {
+                                false
                             }
+                        } else if let StrEsc::Hex { val, n } = esc {
+                            // \u must be followed by exactly 4 hex digits
+                            let Some(d) = hex_val(byte) else {
+                                return false;
+                            };
+                            let v = val * 16 + d as u32;
+                            let nn = n + 1;
+                            if nn < 4 {
+                                self.frames[depth - 1] = Frame::VStr {
+                                    open: true,
+                                    esc: StrEsc::Hex { val: v, n: nn },
+                                    en,
+                                    sbuf,
+                                    cont,
+                                };
+                                return true;
+                            }
+                            // complete the escape: append the decoded
+                            // codepoint as UTF-8 (lone surrogates are left to
+                            // serde's post-hoc validation)
+                            if let Some(c) = char::from_u32(v) {
+                                let mut tmp = [0u8; 4];
+                                sbuf.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+                                if !str_ok(&en, &sbuf) {
+                                    return false;
+                                }
+                            }
+                            self.frames[depth - 1] = Frame::VStr {
+                                open: true,
+                                esc: StrEsc::None,
+                                en,
+                                sbuf,
+                                cont,
+                            };
+                            true
+                        } else {
+                            let ok = match byte {
+                                b'\\' => {
+                                    self.frames[depth - 1] = Frame::VStr {
+                                        open: true,
+                                        esc: StrEsc::Esc,
+                                        en,
+                                        sbuf,
+                                        cont,
+                                    };
+                                    true
+                                }
+                                b'"' => {
+                                    let en_ok = match &en {
+                                        Some(opts) => {
+                                            opts.iter().any(|o| o.as_bytes() == sbuf.as_slice())
+                                        }
+                                        None => true,
+                                    };
+                                    if en_ok {
+                                        self.frames[depth - 1] = self.complete(cont);
+                                    }
+                                    en_ok
+                                }
+                                0x00..=0x1f => false,
+                                _ => {
+                                    sbuf.push(byte);
+                                    if str_ok(&en, &sbuf) {
+                                        self.frames[depth - 1] = Frame::VStr {
+                                            open: true,
+                                            esc: StrEsc::None,
+                                            en,
+                                            sbuf,
+                                            cont,
+                                        };
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                            };
                             return ok;
                         }
-                        let ok = match byte {
-                            b'\\' => {
-                                self.frames[depth - 1] =
-                                    Frame::VStr { open: true, esc: true, en, sbuf, cont };
-                                true
-                            }
-                            b'"' => {
-                                let en_ok = match &en {
-                                    Some(opts) => {
-                                        opts.iter().any(|o| o.as_bytes() == sbuf.as_slice())
-                                    }
-                                    None => true,
-                                };
-                                if en_ok {
-                                    self.frames[depth - 1] = self.complete(cont);
-                                }
-                                en_ok
-                            }
-                            0x00..=0x1f => false,
-                            _ => {
-                                sbuf.push(byte);
-                                let en_ok = match &en {
-                                    Some(opts) => opts
-                                        .iter()
-                                        .any(|o| o.as_bytes().starts_with(sbuf.as_slice())),
-                                    None => true,
-                                };
-                                if en_ok {
-                                    self.frames[depth - 1] =
-                                        Frame::VStr { open: true, esc: false, en, sbuf, cont };
-                                }
-                                en_ok
-                            }
-                        };
-                        return ok;
                     }
-                    Frame::VInt { minus, digits, cont } => {
-                        let (mut minus, mut digits, cont) = (*minus, *digits, cont.clone());
-                        let _ = &mut minus;
+                    Frame::VInt { minus, digits, zero, cont } => {
+                        let (minus, mut digits, mut zero, cont) =
+                            (*minus, *digits, *zero, cont.clone());
                         match byte {
                             b'-' if !minus && digits == 0 => {
-                                minus = true;
-                                self.frames[depth - 1] = Frame::VInt { minus, digits, cont };
+                                self.frames[depth - 1] =
+                                    Frame::VInt { minus: true, digits, zero, cont };
                                 true
                             }
                             b'0'..=b'9' => {
-                                digits += 1;
-                                self.frames[depth - 1] = Frame::VInt { minus, digits, cont };
-                                true
+                                // JSON integers take no leading zeros
+                                if zero {
+                                    false
+                                } else {
+                                    if digits == 0 && byte == b'0' {
+                                        zero = true;
+                                    }
+                                    digits += 1;
+                                    self.frames[depth - 1] =
+                                        Frame::VInt { minus, digits, zero, cont };
+                                    true
+                                }
                             }
                             _ if digits > 0 => {
                                 self.frames[depth - 1] = self.complete(cont);
@@ -542,7 +734,7 @@ impl Grammar {
                         if step_num(&mut nm, byte) {
                             self.frames[depth - 1] = Frame::VNum(nm, cont);
                             true
-                        } else if nm.int_digits > 0 {
+                        } else if num_complete(&nm) {
                             self.frames[depth - 1] = self.complete(cont);
                             continue; // redispatch
                         } else {
@@ -592,13 +784,25 @@ impl Grammar {
                                         cont: cont.clone(),
                                     }),
                                     b't' | b'f' => Some(value_frame(&VSpec::Bool, cont.clone())),
-                                    b'[' => Some(Frame::VArrFirst {
-                                        items: Box::new(VSpec::Any),
-                                        max: None,
+                                    b'n' => Some(Frame::VAny {
+                                        kind: AnyKind::Null { pos: 0 },
                                         cont: cont.clone(),
                                     }),
-                                    b'{' => Some(Frame::VObjFirst {
-                                        spec: Arc::new((Vec::new(), BTreeSet::new())),
+                                    b'[' => Some(Frame::VArrNext {
+                                        items: Box::new(VSpec::Any),
+                                        max: None,
+                                        count: 0,
+                                        cont: cont.clone(),
+                                    }),
+                                    b'{' => Some(Frame::VObjKey {
+                                        spec: Arc::new(ObjSpec {
+                                            props: Vec::new(),
+                                            required: BTreeSet::new(),
+                                            additional: true,
+                                        }),
+                                        seen: BTreeSet::new(),
+                                        buf: String::new(),
+                                        in_str: false,
                                         cont: cont.clone(),
                                     }),
                                     _ => None,
@@ -615,7 +819,6 @@ impl Grammar {
                                 }
                             }
                             AnyKind::Str { esc } => {
-                                let esc = esc;
                                 match (esc, byte) {
                                     (true, _) => {
                                         self.frames[depth - 1] = Frame::VAny {
@@ -639,12 +842,27 @@ impl Grammar {
                                     (false, _) => true,
                                 }
                             }
+                            AnyKind::Null { pos } => {
+                                let word = b"null";
+                                if (pos as usize) < word.len() && byte == word[pos as usize] {
+                                    let np = pos + 1;
+                                    if np as usize == word.len() {
+                                        self.frames[depth - 1] = self.complete(cont);
+                                    } else {
+                                        self.frames[depth - 1] =
+                                            Frame::VAny { kind: AnyKind::Null { pos: np }, cont };
+                                    }
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
                             AnyKind::Num(mut nm) => {
                                 if step_num(&mut nm, byte) {
                                     self.frames[depth - 1] =
                                         Frame::VAny { kind: AnyKind::Num(nm), cont };
                                     true
-                                } else if nm.int_digits > 0 {
+                                } else if num_complete(&nm) {
                                     self.frames[depth - 1] = self.complete(cont);
                                     continue; // redispatch
                                 } else {
@@ -655,17 +873,12 @@ impl Grammar {
                     }
                     Frame::VArrFirst { items, max, cont } => {
                         let (items, max, cont) = (items.clone(), *max, cont.clone());
-                        match byte {
-                            b'[' => {
-                                self.frames[depth - 1] =
-                                    Frame::VArrNext { items, max, count: 0, cont };
-                                true
-                            }
-                            b']' => {
-                                self.frames[depth - 1] = self.complete(cont);
-                                true
-                            }
-                            _ => false,
+                        if byte == b'[' {
+                            self.frames[depth - 1] =
+                                Frame::VArrNext { items, max, count: 0, cont };
+                            true
+                        } else {
+                            false
                         }
                     }
                     Frame::VArrNext { items, max, count, cont } => {
@@ -716,22 +929,17 @@ impl Grammar {
                     }
                     Frame::VObjFirst { spec, cont } => {
                         let (spec, cont) = (spec.clone(), cont.clone());
-                        match byte {
-                            b'{' => {
-                                self.frames[depth - 1] = Frame::VObjKey {
-                                    spec,
-                                    seen: BTreeSet::new(),
-                                    buf: String::new(),
-                                    in_str: false,
-                                    cont,
-                                };
-                                true
-                            }
-                            b'}' => {
-                                self.frames[depth - 1] = self.complete(cont);
-                                true
-                            }
-                            _ => false,
+                        if byte == b'{' {
+                            self.frames[depth - 1] = Frame::VObjKey {
+                                spec,
+                                seen: BTreeSet::new(),
+                                buf: String::new(),
+                                in_str: false,
+                                cont,
+                            };
+                            true
+                        } else {
+                            false
                         }
                     }
                     Frame::VObjKey { spec, seen, buf, in_str, cont } => {
@@ -740,8 +948,17 @@ impl Grammar {
                         if !in_str {
                             if byte == b'"' {
                                 self.frames[depth - 1] = Frame::VObjKey {
-                                    spec, seen, buf: String::new(), in_str: true, cont,
+                                    spec,
+                                    seen,
+                                    buf: String::new(),
+                                    in_str: true,
+                                    cont,
                                 };
+                                true
+                            } else if byte == b'}' && seen.is_empty() && spec.required.is_empty() {
+                                // empty nested object: only legal as the first
+                                // byte, so `"a":1,` can never take this path
+                                self.frames[depth - 1] = self.complete(cont);
                                 true
                             } else {
                                 false
@@ -750,21 +967,24 @@ impl Grammar {
                             if seen.contains(&buf) {
                                 return false;
                             }
-                            match spec.0.iter().find(|(p, _)| p == &buf) {
-                                Some((_, vspec)) => {
-                                    self.pending = Some((buf.clone(), vspec.clone()));
-                                    self.frames[depth - 1] =
-                                        Frame::VObjColon { spec, seen, cont };
-                                    true
-                                }
-                                None => false,
-                            }
+                            let vspec =
+                                spec.props.iter().find(|(p, _)| p == &buf).map(|(_, s)| s.clone());
+                            let vspec = match vspec {
+                                Some(s) => s,
+                                None if spec.additional => VSpec::Any,
+                                None => return false,
+                            };
+                            self.frames[depth - 1] =
+                                Frame::VObjColon { spec, seen, key: buf, vspec, cont };
+                            true
                         } else if byte < 0x20 {
                             false
                         } else {
                             let mut nb = buf.clone();
                             nb.push(byte as char);
-                            if spec.0.iter().any(|(p, _)| p.starts_with(nb.as_str())) {
+                            if spec.props.iter().any(|(p, _)| p.starts_with(nb.as_str()))
+                                || spec.additional
+                            {
                                 self.frames[depth - 1] =
                                     Frame::VObjKey { spec, seen, buf: nb, in_str: true, cont };
                                 true
@@ -773,16 +993,16 @@ impl Grammar {
                             }
                         }
                     }
-                    Frame::VObjColon { spec, seen, cont } => {
-                        let (spec, seen, cont) = (spec.clone(), seen.clone(), cont.clone());
+                    Frame::VObjColon { spec, seen, key, vspec, cont } => {
                         if byte == b':' {
-                            let vspec =
-                                self.pending.as_ref().map(|(_, s)| s.clone()).unwrap_or(VSpec::Any);
-                            let key =
-                                self.pending.as_ref().map(|(k, _)| k.clone()).unwrap_or_default();
                             self.frames[depth - 1] = value_frame(
-                                &vspec,
-                                Cont::ObjValue { spec, seen, key, cont: Box::new(cont) },
+                                vspec,
+                                Cont::ObjValue {
+                                    spec: spec.clone(),
+                                    seen: seen.clone(),
+                                    key: key.clone(),
+                                    cont: Box::new(cont.clone()),
+                                },
                             );
                         }
                         byte == b':'
@@ -801,8 +1021,11 @@ impl Grammar {
                                 true
                             }
                             b'}' => {
-                                self.frames[depth - 1] = self.complete(cont);
-                                true
+                                let ok = spec.required.iter().all(|r| seen.contains(r));
+                                if ok {
+                                    self.frames[depth - 1] = self.complete(cont);
+                                }
+                                ok
                             }
                             _ => false,
                         }
@@ -851,23 +1074,44 @@ pub fn valid_next(g: &Grammar) -> [bool; 256] {
         Some(Frame::CallArgsKey { buf }) => literal_next(&mut out, buf, "\"arguments\""),
         Some(Frame::CallArgsColon) => out[b':' as usize] = true,
         Some(Frame::ArgsOpen) => out[b'{' as usize] = true,
+        Some(Frame::ArgsFirst) => {
+            out[b'"' as usize] = true;
+            let ok = g
+                .tools
+                .get(g.cur_tool)
+                .map(|t| t.required.iter().all(|r| g.args_seen.contains(r)))
+                .unwrap_or(true);
+            if ok {
+                out[b'}' as usize] = true;
+            }
+        }
         Some(Frame::ArgsKey { buf, in_str }) => {
             if !in_str {
                 out[b'"' as usize] = true;
             } else if let Some(t) = g.tools.get(g.cur_tool) {
                 for (p, _) in &t.props {
+                    if g.args_seen.contains(p) {
+                        continue;
+                    }
                     if let Some(c) = p.as_bytes().get(buf.len()) {
                         if p.starts_with(buf.as_str()) {
                             out[*c as usize] = true;
                         }
                     }
                 }
-                if t.props.iter().any(|(p, _)| p == buf) {
+                let fresh = !g.args_seen.contains(buf);
+                if t.props.iter().any(|(p, _)| p == buf) && fresh {
+                    out[b'"' as usize] = true;
+                }
+                if t.additional && fresh {
+                    for b in 0x20u8..=0xff {
+                        out[b as usize] = true;
+                    }
                     out[b'"' as usize] = true;
                 }
             }
         }
-        Some(Frame::ArgsColon) => out[b':' as usize] = true,
+        Some(Frame::ArgsColon { .. }) => out[b':' as usize] = true,
         Some(Frame::ArgsNext) => {
             out[b',' as usize] = true;
             let ok = g
@@ -890,23 +1134,41 @@ pub fn valid_next(g: &Grammar) -> [bool; 256] {
         Some(Frame::VStr { open, esc, .. }) => {
             if !open {
                 out[b'"' as usize] = true;
-            } else if *esc {
-                for b in *b"\"\\/bfnrtu" {
-                    out[b as usize] = true;
-                }
             } else {
-                for b in 0x20u8..=0xff {
-                    out[b as usize] = true;
+                match esc {
+                    StrEsc::None => {
+                        for b in 0x20u8..=0xff {
+                            out[b as usize] = true;
+                        }
+                        out[b'"' as usize] = true;
+                        out[b'\\' as usize] = true;
+                    }
+                    StrEsc::Esc => {
+                        for b in *b"\"\\/bfnrtu" {
+                            out[b as usize] = true;
+                        }
+                    }
+                    StrEsc::Hex { .. } => {
+                        for b in b'0'..=b'9' {
+                            out[b as usize] = true;
+                        }
+                        for b in b'a'..=b'f' {
+                            out[b as usize] = true;
+                        }
+                        for b in b'A'..=b'F' {
+                            out[b as usize] = true;
+                        }
+                    }
                 }
-                out[b'"' as usize] = true;
-                out[b'\\' as usize] = true;
             }
         }
-        Some(Frame::VInt { digits, .. }) => {
-            for b in b'0'..=b'9' {
-                out[b as usize] = true;
+        Some(Frame::VInt { minus, digits, zero, .. }) => {
+            if !zero {
+                for b in b'0'..=b'9' {
+                    out[b as usize] = true;
+                }
             }
-            if *digits == 0 {
+            if !minus && *digits == 0 {
                 out[b'-' as usize] = true;
             }
             if *digits > 0 {
@@ -916,8 +1178,10 @@ pub fn valid_next(g: &Grammar) -> [bool; 256] {
             }
         }
         Some(Frame::VNum(nm, _)) => {
-            for b in b'0'..=b'9' {
-                out[b as usize] = true;
+            if !(nm.lead_zero && !nm.dot && !nm.exp) {
+                for b in b'0'..=b'9' {
+                    out[b as usize] = true;
+                }
             }
             if !nm.minus && nm.int_digits == 0 {
                 out[b'-' as usize] = true;
@@ -931,7 +1195,7 @@ pub fn valid_next(g: &Grammar) -> [bool; 256] {
                 out[b'+' as usize] = true;
                 out[b'-' as usize] = true;
             }
-            if nm.int_digits > 0 {
+            if num_complete(nm) {
                 out[b',' as usize] = true;
                 out[b'}' as usize] = true;
                 out[b']' as usize] = true;
@@ -953,9 +1217,16 @@ pub fn valid_next(g: &Grammar) -> [bool; 256] {
         }
         Some(Frame::VAny { kind, .. }) => match kind {
             AnyKind::Start => {
-                for b in 0x20u8..=0xff {
+                out[b'"' as usize] = true;
+                out[b'-' as usize] = true;
+                for b in b'0'..=b'9' {
                     out[b as usize] = true;
                 }
+                out[b't' as usize] = true;
+                out[b'f' as usize] = true;
+                out[b'n' as usize] = true;
+                out[b'[' as usize] = true;
+                out[b'{' as usize] = true;
             }
             AnyKind::Str { esc } => {
                 if *esc {
@@ -970,9 +1241,17 @@ pub fn valid_next(g: &Grammar) -> [bool; 256] {
                     out[b'\\' as usize] = true;
                 }
             }
+            AnyKind::Null { pos } => {
+                let word = b"null";
+                if let Some(c) = word.get(*pos as usize) {
+                    out[*c as usize] = true;
+                }
+            }
             AnyKind::Num(nm) => {
-                for b in b'0'..=b'9' {
-                    out[b as usize] = true;
+                if !(nm.lead_zero && !nm.dot && !nm.exp) {
+                    for b in b'0'..=b'9' {
+                        out[b as usize] = true;
+                    }
                 }
                 if !nm.minus && nm.int_digits == 0 {
                     out[b'-' as usize] = true;
@@ -982,11 +1261,19 @@ pub fn valid_next(g: &Grammar) -> [bool; 256] {
                     out[b'e' as usize] = true;
                     out[b'E' as usize] = true;
                 }
+                if nm.exp && nm.exp_digits == 0 && !nm.exp_sign {
+                    out[b'+' as usize] = true;
+                    out[b'-' as usize] = true;
+                }
+                if num_complete(nm) {
+                    out[b',' as usize] = true;
+                    out[b'}' as usize] = true;
+                    out[b']' as usize] = true;
+                }
             }
         },
         Some(Frame::VArrFirst { .. }) => {
             out[b'[' as usize] = true;
-            out[b']' as usize] = true;
         }
         Some(Frame::VArrNext { .. }) => {
             out[b',' as usize] = true;
@@ -994,13 +1281,15 @@ pub fn valid_next(g: &Grammar) -> [bool; 256] {
         }
         Some(Frame::VObjFirst { .. }) => {
             out[b'{' as usize] = true;
-            out[b'}' as usize] = true;
         }
         Some(Frame::VObjKey { spec, seen, buf, in_str, .. }) => {
             if !in_str {
                 out[b'"' as usize] = true;
+                if seen.is_empty() && spec.required.is_empty() {
+                    out[b'}' as usize] = true;
+                }
             } else {
-                for (p, _) in &spec.0 {
+                for (p, _) in &spec.props {
                     if seen.contains(p) {
                         continue;
                     }
@@ -1010,15 +1299,25 @@ pub fn valid_next(g: &Grammar) -> [bool; 256] {
                         }
                     }
                 }
-                if spec.0.iter().any(|(p, _)| p == buf) {
+                let fresh = !seen.contains(buf);
+                if spec.props.iter().any(|(p, _)| p == buf) && fresh {
+                    out[b'"' as usize] = true;
+                }
+                if spec.additional && fresh {
+                    for b in 0x20u8..=0xff {
+                        out[b as usize] = true;
+                    }
                     out[b'"' as usize] = true;
                 }
             }
         }
         Some(Frame::VObjColon { .. }) => out[b':' as usize] = true,
-        Some(Frame::VObjNext { .. }) => {
+        Some(Frame::VObjNext { spec, seen, .. }) => {
             out[b',' as usize] = true;
-            out[b'}' as usize] = true;
+            let ok = spec.required.iter().all(|r| seen.contains(r));
+            if ok {
+                out[b'}' as usize] = true;
+            }
         }
         None => {}
     }
@@ -1039,6 +1338,17 @@ mod tests {
         serde_json::from_str(
             r#"[
             {"name":"set_lights","parameters":{"type":"object","properties":{"room":{"type":"string"},"on":{"type":"boolean"},"brightness":{"type":"integer"}},"required":["room","on"]}},
+            {"name":"play_music","parameters":{"type":"object","properties":{"genre":{"type":"string","enum":["rock","jazz"]},"volume":{"type":"integer"}},"required":["genre"]}}
+        ]"#,
+        )
+        .unwrap()
+    }
+
+    /// tools with an empty `properties` object (the trained no-arg shape)
+    fn noarg_toolset() -> Vec<serde_json::Value> {
+        serde_json::from_str(
+            r#"[
+            {"name":"get_time","parameters":{"type":"object","properties":{}}},
             {"name":"play_music","parameters":{"type":"object","properties":{"genre":{"type":"string","enum":["rock","jazz"]},"volume":{"type":"integer"}},"required":["genre"]}}
         ]"#,
         )
@@ -1113,5 +1423,206 @@ mod tests {
         // missing required in nested object
         let mut g = Grammar::compile(&tools);
         assert!(!drive(&mut g, r#"[{"name":"add_event","arguments":{"title":"x","alert":{}}}]"#));
+    }
+
+    #[test]
+    fn empty_arguments_object_accepted() {
+        // no-arg tools emit exactly `"arguments":{}` — the mask must offer
+        // '}' right after '{' and the acceptor must reach Done
+        let mut g = Grammar::compile(&noarg_toolset());
+        assert!(drive(&mut g, r#"[{"name":"get_time","arguments":{}}]"#));
+        assert!(g.is_done());
+
+        let mut g = Grammar::compile(&noarg_toolset());
+        assert!(drive(&mut g, r#"[{"name":"get_time","arguments":{"#));
+        let v = valid_next(&g);
+        assert!(v[b'"' as usize] && v[b'}' as usize]);
+
+        // tools with required keys still reject an empty arguments object
+        let mut g = Grammar::compile(&noarg_toolset());
+        assert!(drive(&mut g, r#"[{"name":"play_music","arguments":{"#));
+        let v = valid_next(&g);
+        assert!(v[b'"' as usize] && !v[b'}' as usize]);
+        assert!(!drive(&mut g, r#"}}]"#));
+
+        // a trailing comma is not resurrected by the empty-object path
+        let mut g = Grammar::compile(&noarg_toolset());
+        assert!(!drive(&mut g, r#"[{"name":"get_time","arguments":{"genre":"rock",}}]"#));
+    }
+
+    #[test]
+    fn object_arg_then_required_sibling() {
+        // regression: a nested object value used to record its inner key at
+        // arguments level, so a required sibling after it dead-ended the call
+        let tools: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"name":"set_reminder","parameters":{"type":"object","properties":{"time":{"type":"string"},"repeat":{"type":"object","properties":{"days":{"type":"array","items":{"type":"string"}}},"required":["days"]}},"required":["time","repeat"]}}]"#,
+        )
+        .unwrap();
+        let mut g = Grammar::compile(&tools);
+        assert!(drive(&mut g, r#"[{"name":"set_reminder","arguments":{"repeat":{"days":["mon"]},"time":"now"}}]"#));
+        assert!(g.is_done());
+
+        // both orders work
+        let mut g = Grammar::compile(&tools);
+        assert!(drive(&mut g, r#"[{"name":"set_reminder","arguments":{"time":"now","repeat":{"days":[]}}}]"#));
+        assert!(g.is_done());
+
+        // missing required sibling / missing nested required still reject
+        let mut g = Grammar::compile(&tools);
+        assert!(!drive(&mut g, r#"[{"name":"set_reminder","arguments":{"time":"now"}}]"#));
+        let mut g = Grammar::compile(&tools);
+        assert!(!drive(&mut g, r#"[{"name":"set_reminder","arguments":{"repeat":{},"time":"now"}}]"#));
+        // duplicated outer key is rejected even with a required sibling present
+        let mut g = Grammar::compile(&tools);
+        assert!(!drive(&mut g, r#"[{"name":"set_reminder","arguments":{"repeat":{"days":["mon"]},"time":"now","repeat":{"days":["tue"]}}}]"#));
+    }
+
+    #[test]
+    fn duplicate_outer_keys_rejected() {
+        // regression: nested keys were recorded at arguments level, so a
+        // duplicated outer key slipped through when nothing was required
+        let tools: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"name":"note","parameters":{"type":"object","properties":{"repeat":{"type":"object","properties":{"days":{"type":"array","items":{"type":"string"}}},"required":["days"]}}}}]"#,
+        )
+        .unwrap();
+        let mut g = Grammar::compile(&tools);
+        assert!(drive(&mut g, r#"[{"name":"note","arguments":{"repeat":{"days":["mon"]}}}]"#));
+        let mut g = Grammar::compile(&tools);
+        assert!(!drive(&mut g, r#"[{"name":"note","arguments":{"repeat":{"days":["mon"]},"repeat":{"days":["tue"]}}}]"#));
+    }
+
+    #[test]
+    fn spaces_in_tool_names_keys_and_enums() {
+        // the acceptor side of decoded-space matching: schema strings with
+        // spaces must prefix-match and enum-compare in decoded space
+        let tools: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"name":"set lights","parameters":{"type":"object","properties":{"living room":{"type":"string","enum":["bright white","dim red"]},"on":{"type":"boolean"}},"required":["living room","on"]}}]"#,
+        )
+        .unwrap();
+        let mut g = Grammar::compile(&tools);
+        assert!(drive(&mut g, r#"[{"name":"set lights","arguments":{"living room":"dim red","on":true}}]"#));
+        assert!(g.is_done());
+        // unknown enum value with spaces
+        let mut g = Grammar::compile(&tools);
+        assert!(!drive(&mut g, r#"[{"name":"set lights","arguments":{"living room":"bright blue","on":true}}]"#));
+        // tool name without its space is not a prefix match
+        let mut g = Grammar::compile(&tools);
+        assert!(!drive(&mut g, r#"[{"name":"setlights","arguments":{"living room":"dim red","on":true}}]"#));
+    }
+
+    #[test]
+    fn free_form_object_values() {
+        // object with no declared properties accepts arbitrary keys/values
+        let tools: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"name":"send","parameters":{"type":"object","properties":{"payload":{"type":"object"},"strict":{"type":"object","properties":{"code":{"type":"integer"}}}},"required":["payload"]}}]"#,
+        )
+        .unwrap();
+        let mut g = Grammar::compile(&tools);
+        assert!(drive(&mut g, r#"[{"name":"send","arguments":{"payload":{"any_key":[1,"two",true,null,{"deep":false}],"n":-1.5e2}}}]"#));
+        assert!(g.is_done());
+        // declared-property object without additionalProperties stays strict
+        let mut g = Grammar::compile(&tools);
+        assert!(!drive(&mut g, r#"[{"name":"send","arguments":{"payload":{},"strict":{"wrong":1}}}]"#));
+
+        // additionalProperties: true accepts unknown keys beside declared ones
+        let tools: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"name":"send","parameters":{"type":"object","properties":{"strict":{"type":"object","properties":{"code":{"type":"integer"}},"additionalProperties":true}},"required":["strict"]}}]"#,
+        )
+        .unwrap();
+        let mut g = Grammar::compile(&tools);
+        assert!(drive(&mut g, r#"[{"name":"send","arguments":{"strict":{"code":1,"other":[true,null]}}}]"#));
+        assert!(g.is_done());
+    }
+
+    #[test]
+    fn nested_empty_object_accepted() {
+        // all-optional nested object may close with '{}'
+        let tools: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"name":"remind","parameters":{"type":"object","properties":{"alert":{"type":"object","properties":{"minutes":{"type":"integer"}}},"title":{"type":"string"}},"required":["title"]}}]"#,
+        )
+        .unwrap();
+        let mut g = Grammar::compile(&tools);
+        assert!(drive(&mut g, r#"[{"name":"remind","arguments":{"title":"x","alert":{}}}]"#));
+        assert!(g.is_done());
+        let mut g = Grammar::compile(&tools);
+        assert!(drive(&mut g, r#"[{"name":"remind","arguments":{"alert":{},"title":"x"}}]"#));
+        assert!(g.is_done());
+
+        // nested required keys are enforced wherever the object closes
+        let tools: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"name":"remind","parameters":{"type":"object","properties":{"alert":{"type":"object","properties":{"minutes":{"type":"integer"}},"required":["minutes"]}}}}]"#,
+        )
+        .unwrap();
+        let mut g = Grammar::compile(&tools);
+        assert!(!drive(&mut g, r#"[{"name":"remind","arguments":{"alert":{}}}]"#));
+        // ...including after a complete pair, and trailing commas stay illegal
+        let mut g = Grammar::compile(&tools);
+        assert!(!drive(&mut g, r#"[{"name":"remind","arguments":{"alert":{"minutes":5,}}}]"#));
+    }
+
+    #[test]
+    fn escaped_chars_in_strings_and_enums() {
+        // escaped bytes join the decoded buffer, so enums containing quotes
+        // and escapes compare in decoded space
+        let tools: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"name":"say","parameters":{"type":"object","properties":{"phrase":{"type":"string","enum":["say \"hi\"","a\\b","A"]}},"required":["phrase"]}}]"#,
+        )
+        .unwrap();
+        let mut g = Grammar::compile(&tools);
+        assert!(drive(&mut g, r#"[{"name":"say","arguments":{"phrase":"say \"hi\""}}]"#));
+        assert!(g.is_done());
+        let mut g = Grammar::compile(&tools);
+        assert!(drive(&mut g, r#"[{"name":"say","arguments":{"phrase":"a\\b"}}]"#));
+        // \u0041 decodes to 'A'
+        let mut g = Grammar::compile(&tools);
+        assert!(drive(&mut g, r#"[{"name":"say","arguments":{"phrase":"\u0041"}}]"#));
+        assert!(g.is_done());
+        // invalid escape, truncated \u escape, and wrong enum are rejected
+        let mut g = Grammar::compile(&tools);
+        assert!(!drive(&mut g, r#"[{"name":"say","arguments":{"phrase":"\x"}}]"#));
+        let mut g = Grammar::compile(&tools);
+        assert!(!drive(&mut g, r#"[{"name":"say","arguments":{"phrase":"\u12"}}]"#));
+        let mut g = Grammar::compile(&tools);
+        assert!(!drive(&mut g, r#"[{"name":"say","arguments":{"phrase":"say \"ho\""}}]"#));
+    }
+
+    #[test]
+    fn rejects_invalid_numbers() {
+        let tools: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"name":"calc","parameters":{"type":"object","properties":{"n":{"type":"number"},"i":{"type":"integer"}},"required":["n","i"]}}]"#,
+        )
+        .unwrap();
+        for bad in ["1e", "1.", "007", "01", "1e+", "1.e3", "-", "1..2", "1ee2"] {
+            let s = format!(r#"[{{"name":"calc","arguments":{{"n":{bad},"i":1}}}}]"#);
+            let mut g = Grammar::compile(&tools);
+            assert!(!drive(&mut g, &s), "accepted {bad}");
+        }
+        for good in ["0", "-0", "10", "-12", "0.5", "1e3", "1.5E-2", "0e0", "3.0"] {
+            let s = format!(r#"[{{"name":"calc","arguments":{{"n":{good},"i":1}}}}]"#);
+            let mut g = Grammar::compile(&tools);
+            assert!(drive(&mut g, &s), "rejected {good}");
+        }
+        for bad in ["007", "01", "-"] {
+            let s = format!(r#"[{{"name":"calc","arguments":{{"n":1,"i":{bad}}}}}]"#);
+            let mut g = Grammar::compile(&tools);
+            assert!(!drive(&mut g, &s), "accepted int {bad}");
+        }
+        let mut g = Grammar::compile(&tools);
+        assert!(drive(&mut g, r#"[{"name":"calc","arguments":{"n":1,"i":-12}}]"#));
+    }
+
+    #[test]
+    fn null_values_accepted() {
+        // free-form values (no item schema) include JSON null
+        let tools: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"name":"mix","parameters":{"type":"object","properties":{"payload":{"type":"object"},"tags":{"type":"array"}},"required":["payload"]}}]"#,
+        )
+        .unwrap();
+        let mut g = Grammar::compile(&tools);
+        assert!(drive(&mut g, r#"[{"name":"mix","arguments":{"payload":{"a":null},"tags":[null,1,"x",true,{"k":null}]}}]"#));
+        assert!(g.is_done());
+        // trailing garbage after null is still rejected
+        let mut g = Grammar::compile(&tools);
+        assert!(!drive(&mut g, r#"[{"name":"mix","arguments":{"payload":{"a":nullx}}}]"#));
     }
 }
