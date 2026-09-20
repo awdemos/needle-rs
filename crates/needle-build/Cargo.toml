@@ -12,3 +12,10 @@ half = "2"
 needle-tokenizer = { path = "../needle-tokenizer" }
 needle-model = { path = "../needle-model" }
 needle-engine = { path = "../needle-engine" }
+vstd = "=0.0.0-2026-09-20-0158"
+
+[package.metadata.verus]
+verify = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)'] }
